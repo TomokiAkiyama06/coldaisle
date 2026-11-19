@@ -84,7 +84,8 @@ def test_modes_that_cannot_be_decided_are_rejected(tmp_path: Path, mode: object)
         ("amplitude", {"value": float("nan"), "status": "provisional"}, "amplitude"),
         ("on_ms", {"value": 0, "status": "provisional"}, "on_ms"),
         ("off_min_ms", {"value": 1_300_000, "status": "provisional"}, "off_min_ms"),
-        ("margin_c", {"value": 0.0, "status": "provisional"}, "margin_c"),
+        ("cpu_max_c", {"value": 0.0, "status": "provisional"}, "cpu_max_c"),
+        ("gpu_max_c", {"value": float("inf"), "status": "provisional"}, "gpu_max_c"),
         ("allowed_hours", {"value": [8, 8], "status": "provisional"}, "allowed_hours"),
         ("allowed_hours", {"value": [22, 6], "status": "provisional"}, "allowed_hours"),
         ("allowed_hours", {"value": [0, 25], "status": "provisional"}, "allowed_hours"),
@@ -128,7 +129,8 @@ def test_provisional_values_are_listed(tmp_path: Path) -> None:
         "zone_excitation.on_ms",
         "zone_excitation.off_min_ms",
         "zone_excitation.off_max_ms",
-        "zone_excitation.margin_c",
+        "zone_excitation.cpu_max_c",
+        "zone_excitation.gpu_max_c",
         "zone_excitation.allowed_hours",
     } <= paths
 

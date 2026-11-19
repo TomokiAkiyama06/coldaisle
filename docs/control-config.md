@@ -176,7 +176,7 @@ Model を Production へ昇格させても authority は動かない（#104 と 
 v8からv9へは `authority_rollout` を追加してから `schema_version: 9` へ上げる。
 v1〜v8は自動補完せず起動前に拒否する。
 
-## Control Config v18 と `fan-policy.yaml` v14（#84 / 決定記録 0185 §2.4）
+## Control Config v18 と `fan-policy.yaml` v14（#84 / 決定記録 0185 §2.4 / 0186）
 
 束ねた版 `CONTROL_CONFIG_VERSION` を 17 → 18 に上げ、`fan-policy.yaml` を schema version 13 → 14 にした
 （ほかのファイルの版は変えない。`fan-hardware.yaml` 2、`safety.yaml` 5、`air-balance.yaml` 2）。
@@ -190,18 +190,19 @@ zone_excitation:
   on_ms: {value: 300000, status: provisional}         # 1 つの揺らぎの区間の長さ
   off_min_ms: {value: 600000, status: provisional}    # 区間の間の長さは [off_min_ms, off_max_ms] の一様乱数
   off_max_ms: {value: 1200000, status: provisional}
-  margin_c: {value: 8.0, status: provisional}         # CPU・GPU が 0121 §2.1 の中止の基準よりこれだけ低いときだけ掛ける
+  cpu_max_c: {value: 80.0, status: provisional}       # cpu.package がこれより低いときだけ掛ける（0186 §2.2）
+  gpu_max_c: {value: 77.0, status: provisional}       # gpu.0.core がこれより低いときだけ掛ける。温度が使えない tick は掛けない
   allowed_hours: {value: [0, 24], status: provisional}  # [開始, 終了) の fand のローカル時刻の時。[0, 24] は終日
   seed: 1                                             # 予定の乱数の種
 ```
 
-- 値は 0185 §5 で所有者が決めた値（2026-11-19）。`status` は運用で様子を見るまで `provisional` のまま
+- 値は 0185 §5 と 0186 §2.2 で所有者が決めた値（2026-11-19）。`status` は運用で様子を見るまで `provisional` のまま
 - `mode` は人が設定と再起動で `off` → `apply` と進める（0078 §2.8 と同じ。authority journal を経ない）。`shadow` は無い
   （0185 §5 の 6）。YAML 1.1 では引用符の無い `off` が真偽値の偽になる。偽だけを `off` と読み、真は拒否する
 - **形**と**値**の誤り（`amplitude` が `(0, 0.3]` の外・`off_min_ms > off_max_ms`・`allowed_hours` が `0 <= 開始 < 終了 <= 24`
   でない・未知の鍵）はどれも Control Config の不正（`config_invalid` の全 zone Max）。黙って `off` と読まない
-- 揺らぎは**上げるだけ**で、Air Balance の協調の後・Gate / Reactive Guard / Critical Safety の前に掛かる（0185 §2.1）。
-  Guard の ceiling も Safety の floor・`forced_max` も迂回しない
+- 揺らぎは**上げるだけ**で、Gate の後・Reactive Guard / Critical Safety の前に、Gate が Baseline を選んだ tick の requested に
+  だけ掛かる（0185 §2.1 / 0186 §2.1）。Guard の ceiling も Safety の floor・`forced_max` も迂回しない
 - **この版では設定を読むだけで、fand はまだ揺らぎを掛けない**（`mode: "apply"` でも運転は変わらない）。揺らぎの部品と
   ControlTick v18 の記録は後続の PR で足す
 - 欄を足したので `fan-policy.yaml` の hash が変わる。authority の照合（0090）で、承認のときと設定が違えば Baseline より上を

@@ -1377,7 +1377,7 @@ def _yaml_excitation_mode(value: object) -> object:
 ExcitationAmplitude = Annotated[float, Field(gt=0.0, le=0.3, allow_inf_nan=False)]
 """揺らぎで足す幅（demand）。0 は「掛けない」と同じなので ``mode: "off"`` で表し、値では許さない。
 上限 0.3 は 0183 の段の試験の幅（0.60 → 0.90）。それより大きな上乗せは段の試験の外の運転になる。"""
-PositiveCelsiusMargin = Annotated[float, Field(gt=0.0, allow_inf_nan=False)]
+PositiveCelsius = Annotated[float, Field(gt=0.0, allow_inf_nan=False)]
 HourRange = Annotated[tuple[int, int], BeforeValidator(_yaml_sequence_to_tuple)]
 
 
@@ -1386,7 +1386,8 @@ class ZoneExcitationConfig(_ConfigModel):
 
     有効化は ``mode`` を人が ``off`` → ``apply`` と設定して再起動するだけで進む（0078 §2.8 と同じ。
     authority journal を経ない）。揺らぎは上げるだけで、Guard と Critical Safety の前に掛かる
-    （0185 §2.1）。**値の既定はコードに持たない**（AGENTS.md ルール 9）。
+    （0185 §2.1）。位置は Gate の後・Guard の前で、Gate が Baseline を選んだ tick だけに掛ける
+    （決定記録 0186 §2.1）。**値の既定はコードに持たない**（AGENTS.md ルール 9）。
     """
 
     mode: Annotated[ZoneExcitationMode, BeforeValidator(_yaml_excitation_mode)]
@@ -1400,8 +1401,11 @@ class ZoneExcitationConfig(_ConfigModel):
     off_min_ms: PolicyMilliseconds
     off_max_ms: PolicyMilliseconds
     """``off`` の区間の長さは ``[off_min_ms, off_max_ms]`` の一様乱数（0185 §2.2）。"""
-    margin_c: ConfigValue[PositiveCelsiusMargin]
-    """CPU・GPU の温度が中止の基準（0121 §2.1）よりこれだけ低いときだけ掛ける（0185 §2.3）。"""
+    cpu_max_c: ConfigValue[PositiveCelsius]
+    gpu_max_c: ConfigValue[PositiveCelsius]
+    """``cpu.package`` が ``cpu_max_c`` より、``gpu.0.core`` が ``gpu_max_c`` より低いときだけ
+    掛ける（決定記録 0186 §2.2。0185 §2.3 の ``margin_c`` を置き換えた）。温度が使えない tick は
+    掛けない。"""
     allowed_hours: ConfigValue[HourRange]
     """掛ける時間帯 ``[開始, 終了)``（fand のローカル時刻の時）。``[0, 24]`` は終日。日をまたぐ帯は
     書けない（2 つの帯が要る運用になったら版を上げて列にする）。"""
@@ -1854,7 +1858,15 @@ class ControlConfig(_ConfigModel):
             coordination.release_hold_ms,
         )
         excitation = self.policy.zone_excitation
-        for name in ("amplitude", "on_ms", "off_min_ms", "off_max_ms", "margin_c", "allowed_hours"):
+        for name in (
+            "amplitude",
+            "on_ms",
+            "off_min_ms",
+            "off_max_ms",
+            "cpu_max_c",
+            "gpu_max_c",
+            "allowed_hours",
+        ):
             append("fan-policy.yaml", f"zone_excitation.{name}", getattr(excitation, name))
         for zone in Zone:
             bound = optimizer.zone_bounds.get(zone)
