@@ -133,9 +133,9 @@ def rejection(tmp_path: Path, docs: dict[str, dict[str, Any]]) -> HintGateReject
 
 
 def test_versions_were_raised() -> None:
-    assert FAN_POLICY_CONFIG_VERSION == 13
+    assert FAN_POLICY_CONFIG_VERSION == 14
     assert SAFETY_CONFIG_VERSION == 5
-    assert CONTROL_CONFIG_VERSION == 17
+    assert CONTROL_CONFIG_VERSION == 18
 
 
 @pytest.mark.parametrize(("name", "old"), [("fan-policy.yaml", 12), ("safety.yaml", 4)])
