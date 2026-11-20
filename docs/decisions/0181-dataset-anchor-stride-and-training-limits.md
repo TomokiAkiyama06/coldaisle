@@ -3,6 +3,7 @@
 - **種別**: Decision Record
 - **Status**: FINAL（2026-11-05、リポジトリ所有者の承認。§5 の 1〜3 はすべて推奨の案）
 - **Date**: 2026-11-05
+- **Superseded by**: [0187](0187-ridge-shared-gram.md)（§2.2 の `MAX_RIDGE_WORK_UNITS` の数え方だけ。上限の値と他の節は有効）
 - **Supersedes**: 次の部分だけを置き換える。他の点は有効。
   - [`0087`](0087-dataset-v2-action-grid.md) のうち、Dataset v2 で anchor にできる ControlTick を**すべて** anchor にする部分（0031 §2.1 の
     「1つの ControlTick を基点とする」を v2 で受け継いだもの）。v2 の spec の欄 `anchor_stride_ms` で間引く（§2.1）。0087 の格子・鮮度・除外の規則は変えない
