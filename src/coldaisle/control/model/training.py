@@ -9,6 +9,7 @@ import os
 import re
 import stat
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -70,7 +71,10 @@ MAX_DATASET_TEXT_BYTES = 1024**3
 """全 example（と split）の metric 名・ID・理由の文字列の合計。数える文字列は ``examples.jsonl`` の
 中身の一部なので ``MAX_DATASET_EXAMPLES_BYTES`` と同じにする（0181 §2.2。レビューで足した）。"""
 MAX_RIDGE_WORK_UNITS = 20_000_000_000
-"""出力 × (件数 × 列² + 列³)。純粋な Python の ridge で約 10 分（3.5 × 10⁷ 単位/秒。0181 §2.2）。"""
+"""ridge の実際の計算の量。純粋な Python で約 10 分（3.5 × 10⁷ 単位/秒。値は 0181 §2.2）。
+
+数え方は決定記録 0187 §2.2: label を使う行の集合ごとの Gram（件数 × 列 × (列 + 1) / 2）と、
+出力ごとの rhs と掃き出し（件数 × 列 + 列³）の和。"""
 MAX_DATASET_MANIFEST_BYTES = 8 * 1024 * 1024
 MAX_DATASET_EXAMPLES_BYTES = 1024**3
 """``examples.jsonl`` の bytes（1 GiB。30 s 間隔で 30 日分に近い。0181 §2.2）。"""
@@ -267,42 +271,44 @@ def train_ridge_baseline(
     if not split.train:
         raise ValueError("ridge baselineの学習にはtrain exampleが1件以上必要")
     train_examples = tuple(sorted(split.train, key=_example_order))
+    heads = _select_head_rows(train_examples, target_schema)
+    _validate_ridge_work(
+        row_set_sizes=tuple(len(indices) for indices in {head.indices for head in heads}),
+        head_sizes=tuple(len(head.indices) for head in heads),
+        feature_count=len(feature_schema.columns),
+    )
     raw_rows = tuple(
         raw_feature_values(ObservedThermalInput.from_example(example), feature_schema)
         for example in train_examples
     )
     means, scales, observed_counts, rows = _fit_preprocessing(raw_rows)
 
+    # 行の集合が同じ head は Gram を共有する（0187 §2.1）。math.fsum は正確に丸めるので
+    # 共有しても bytes は変わらない。最後に使う head の後で捨て、同時に持つ集合を減らす。
+    last_use = {head.indices: position for position, head in enumerate(heads)}
+    grams: dict[tuple[int, ...], _RidgeGram] = {}
     outputs: list[RidgeOutput] = []
-    for horizon in target_schema.horizons_ms:
-        for metric in target_schema.metrics:
-            selected_rows: list[tuple[float, ...]] = []
-            labels: list[float] = []
-            for example, row in zip(train_examples, rows, strict=True):
-                target = next(item for item in example.targets if item.horizon_ms == horizon)
-                value = target.values[metric]
-                if target.quality[metric] is not Quality.OK or value is None:
-                    continue
-                selected_rows.append(row)
-                labels.append(value)
-            if not labels:
-                raise ValueError(
-                    f"観測済みlabelが無いため学習できない: horizon={horizon}, metric={metric}"
-                )
-            intercept, coefficients = _fit_ridge(
-                tuple(selected_rows),
-                tuple(labels),
-                ridge_lambda=training.ridge_lambda,
+    for position, head in enumerate(heads):
+        gram = grams.get(head.indices)
+        if gram is None:
+            gram = _ridge_gram(tuple(rows[index] for index in head.indices))
+            grams[head.indices] = gram
+        intercept, coefficients = _fit_ridge_from_gram(
+            gram,
+            head.labels,
+            ridge_lambda=training.ridge_lambda,
+        )
+        if last_use[head.indices] == position:
+            del grams[head.indices]
+        outputs.append(
+            RidgeOutput(
+                horizon_ms=head.horizon_ms,
+                metric=head.metric,
+                intercept=intercept,
+                coefficients=coefficients,
+                training_samples=len(head.labels),
             )
-            outputs.append(
-                RidgeOutput(
-                    horizon_ms=horizon,
-                    metric=metric,
-                    intercept=intercept,
-                    coefficients=coefficients,
-                    training_samples=len(labels),
-                )
-            )
+        )
 
     payload = RidgeModelPayload(
         feature_means=means,
@@ -465,9 +471,6 @@ def _validate_training_resource_limits(
         raise ValueError("split target cell総数がbaseline trainerの安全上限を超えている")
     if split_count != dataset_count:
         raise ValueError("datasetとsplitのexample総数が一致しない")
-    ridge_work = output_count * (train_count * feature_count * feature_count + feature_count**3)
-    if ridge_work > MAX_RIDGE_WORK_UNITS:
-        raise ValueError("ridge演算量がbaseline trainerの安全上限を超えている")
     spec = dataset.manifest.spec
     expected_frame_count = spec.window_ms // spec.sample_period_ms + 1
     _validate_source_run_container_sizes(dataset)
@@ -723,33 +726,125 @@ def _fit_preprocessing(
     return tuple(means), tuple(scales), tuple(observed_counts), normalized
 
 
-def _fit_ridge(
-    rows: tuple[tuple[float, ...], ...],
-    labels: tuple[float, ...],
+@dataclass(frozen=True)
+class _HeadRows:
+    """1 つの head（horizon × target）が使う train の行の番号と label。"""
+
+    horizon_ms: int
+    metric: str
+    indices: tuple[int, ...]
+    labels: tuple[float, ...]
+
+
+@dataclass(frozen=True)
+class _RidgeGram:
+    """行の集合 1 つの中心化した特徴量と Gram（λ を足す前。共有するので書き換えない）。"""
+
+    feature_means: tuple[float, ...]
+    centered_rows: tuple[tuple[float, ...], ...]
+    gram: tuple[tuple[float, ...], ...]
+
+
+def _select_head_rows(
+    train_examples: tuple[DatasetExample | DatasetExampleV2, ...],
+    target_schema: ThermalTargetSchema,
+) -> tuple[_HeadRows, ...]:
+    heads: list[_HeadRows] = []
+    for horizon in target_schema.horizons_ms:
+        for metric in target_schema.metrics:
+            indices: list[int] = []
+            labels: list[float] = []
+            for index, example in enumerate(train_examples):
+                target = next(item for item in example.targets if item.horizon_ms == horizon)
+                value = target.values[metric]
+                if target.quality[metric] is not Quality.OK or value is None:
+                    continue
+                indices.append(index)
+                labels.append(value)
+            if not labels:
+                raise ValueError(
+                    f"観測済みlabelが無いため学習できない: horizon={horizon}, metric={metric}"
+                )
+            heads.append(
+                _HeadRows(
+                    horizon_ms=horizon,
+                    metric=metric,
+                    indices=tuple(indices),
+                    labels=tuple(labels),
+                )
+            )
+    return tuple(heads)
+
+
+def _validate_ridge_work(
     *,
-    ridge_lambda: float,
-) -> tuple[float, tuple[float, ...]]:
+    row_set_sizes: tuple[int, ...],
+    head_sizes: tuple[int, ...],
+    feature_count: int,
+) -> None:
+    """Gram を作る前に、実際の計算の量を上限と比べる（0187 §2.2）。"""
+    gram_work = sum(size * feature_count * (feature_count + 1) // 2 for size in row_set_sizes)
+    head_work = sum(size * feature_count + feature_count**3 for size in head_sizes)
+    if gram_work + head_work > MAX_RIDGE_WORK_UNITS:
+        raise ValueError("ridge演算量がbaseline trainerの安全上限を超えている")
+
+
+def _ridge_gram(rows: tuple[tuple[float, ...], ...]) -> _RidgeGram:
     width = len(rows[0])
-    label_mean = math.fsum(labels) / len(labels)
     feature_means = tuple(
         math.fsum(row[column] for row in rows) / len(rows) for column in range(width)
     )
     centered_rows = tuple(
         tuple(value - feature_means[column] for column, value in enumerate(row)) for row in rows
     )
-    centered_labels = tuple(label - label_mean for label in labels)
     try:
-        gram = [
-            [math.fsum(row[left] * row[right] for row in centered_rows) for right in range(width)]
+        # 対称なので上三角だけを足し、下三角へ写す（積は可換で、fsum は順に依らない）
+        upper = [
+            [
+                math.fsum(row[left] * row[right] for row in centered_rows)
+                for right in range(left, width)
+            ]
             for left in range(width)
         ]
+    except OverflowError as exc:
+        raise ValueError("ridge normal equationが有限範囲を超えた") from exc
+    gram = tuple(
+        tuple(
+            upper[left][right - left] if right >= left else upper[right][left - right]
+            for right in range(width)
+        )
+        for left in range(width)
+    )
+    return _RidgeGram(feature_means=feature_means, centered_rows=centered_rows, gram=gram)
+
+
+def _fit_ridge(
+    rows: tuple[tuple[float, ...], ...],
+    labels: tuple[float, ...],
+    *,
+    ridge_lambda: float,
+) -> tuple[float, tuple[float, ...]]:
+    return _fit_ridge_from_gram(_ridge_gram(rows), labels, ridge_lambda=ridge_lambda)
+
+
+def _fit_ridge_from_gram(
+    shared: _RidgeGram,
+    labels: tuple[float, ...],
+    *,
+    ridge_lambda: float,
+) -> tuple[float, tuple[float, ...]]:
+    width = len(shared.feature_means)
+    label_mean = math.fsum(labels) / len(labels)
+    centered_labels = tuple(label - label_mean for label in labels)
+    gram = [list(row) for row in shared.gram]
+    try:
         _require_effective_ridge_lambda(gram, ridge_lambda)
         for index in range(width):
             gram[index][index] += ridge_lambda
         rhs = [
             math.fsum(
                 row[column] * label
-                for row, label in zip(centered_rows, centered_labels, strict=True)
+                for row, label in zip(shared.centered_rows, centered_labels, strict=True)
             )
             for column in range(width)
         ]
@@ -757,7 +852,8 @@ def _fit_ridge(
         raise ValueError("ridge normal equationが有限範囲を超えた") from exc
     coefficients = _solve_linear_system(gram, rhs)
     intercept = label_mean - math.fsum(
-        coefficient * mean for coefficient, mean in zip(coefficients, feature_means, strict=True)
+        coefficient * mean
+        for coefficient, mean in zip(coefficients, shared.feature_means, strict=True)
     )
     if not math.isfinite(intercept) or any(
         not math.isfinite(coefficient) for coefficient in coefficients

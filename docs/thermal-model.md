@@ -21,6 +21,9 @@ window幅、sample period、horizon、metric集合、ridge lambdaに本番既定
 あるが、これはpure-Python v1の安全境界であり本番parameterの推奨値ではない。
 trainerはtrainだけでなくdataset / split全体の件数、feature / target cell数、source reference、
 action / fault metadataを事前検査し、output数を含むridge演算量も行列構築前に制限する。
+labelを使う行の集合が同じoutputはGram行列を共有し、対称の上三角だけを計算する。
+`math.fsum`は正確に丸めるので、共有してもartifactのbytesは変わらない。演算量は行の集合ごとのGramと
+outputごとのrhs・掃き出しの和で数え、行の集合を決めた後・Gramを作る前に検査する（決定記録0187）。
 artifact payload、source run、runtime window / mappingの各containerもschema上限と入口の事前検査を
 持つ。metric名と、共有参照がserialization時に反復される場合を含む総text byte数も制限する。
 
