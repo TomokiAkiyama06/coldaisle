@@ -391,7 +391,7 @@ def test_the_daemon_stores_its_run_id_on_every_tick_without_an_admin_entry(
 
     with SqliteStore(configs[0].db, rules=rules, clock=SimulatedClock(0)) as opened:
         (stored,) = [json.loads(trace.trace_json) for trace in opened.control_traces(0, 2**62)]
-        assert stored["schema_version"] == 17
+        assert stored["schema_version"] == 18
         assert stored["run_id"] == ticks[0].run_id
         # 同じ run の記録だけが突き合う（tick_id と ts_ms が同じでも別の run は対応しない）
         opened.record_hint_shadow(

@@ -2047,7 +2047,8 @@ class AuthorityRuntime:
         return tuple(item.to_stage for item in self._pending)
 
     def trace_record(self, *, command_id: int | None) -> AuthorityRecord:
-        """decision trace（`ControlTick` v13）へ残す、この時点の制御権の出どころ。"""
+        """decision trace（`ControlTick` v13。v18 から `AuthorityRecord` v2）へ残す、この時点の
+        制御権の出どころ。"""
         return AuthorityRecord(
             entry="journal",
             journal_stage=self._journal.stage,
@@ -2061,6 +2062,10 @@ class AuthorityRuntime:
             journal_unreadable=self._journal_unreadable,
             command_id=command_id,
             persist_failure=self._persist_failure,
+            # v2（ControlTick v18。0089 §5 の 1 / 0090 §5 の 3）: 照合の上限だけを載せる。
+            # FULL は「上限なし」と同じ事実なので None で表す（unpersisted_ceiling と同じ）。
+            artifact_ceiling=_ceiling_or_none(self.artifact_ceiling),
+            config_binding_ceiling=_ceiling_or_none(self.config_binding_ceiling),
         )
 
     def trace_metadata(self) -> dict[str, object]:
@@ -2537,3 +2542,8 @@ def _check_actor_and_reason(actor: str, reason: str) -> None:
         raise ValueError("actor が journal の形に合わない")
     if not 1 <= len(reason) <= _REASON_MAX_CHARS:
         raise ValueError("reason の長さが journal の形に合わない")
+
+
+def _ceiling_or_none(stage: AuthorityStage) -> AuthorityStage | None:
+    """照合の上限を trace の形にする。FULL（上限なし）は None（`AuthorityRecord` v2）。"""
+    return None if stage is AuthorityStage.FULL else stage

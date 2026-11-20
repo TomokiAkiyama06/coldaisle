@@ -42,6 +42,7 @@ from coldaisle.control.schema import (
     SupervisorPolicyKind,
     WorkloadHintRecord,
     WorkloadRegime,
+    ZoneExcitationRecord,
 )
 from coldaisle.control.supervisor import (
     RulePolicy,
@@ -272,6 +273,7 @@ class Fixture:
             telemetry_health=TELEMETRY_HEALTH_RECORD,
             run_id=TRACE_RUN_ID,
             workload_hint=WorkloadHintRecord.off(),
+            zone_excitation=ZoneExcitationRecord.off(),
         )
 
 

@@ -35,6 +35,8 @@
   //   画面に出すかは 0064 §5 #5 のとおり別に決めるので、ここでは表示しない。
   // v17（#288 / 決定記録 0162 §2.5 の PR-C）: `workload_hint` を v2 にした（`certificate` と
   //   `shadow_counters`）。版を読めるようにするだけで、証明書・Shadow の数は画面に出さない（0133 §2.5a）。
+  // v18（#84 / 決定記録 0185 §2.5 / 0186）: `zone_excitation`（普段の運転の揺らぎ）と `authority` の v2
+  //   （照合の上限 2 つ）。版を読めるようにするだけで、画面には出さない。
   const SINCE = {
     workload_regime: 2,
     supervisor: 3,
@@ -51,8 +53,9 @@
     tach_unconfirmed_zones: 14,
     telemetry_health: 15,
     run_id: 16,
+    zone_excitation: 18,
   };
-  const KNOWN_VERSIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17];
+  const KNOWN_VERSIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18];
 
   const NOT_IN_VERSION = "この版の記録には無い";
   const ZONE_KEYS = ["front", "rear", "top"];

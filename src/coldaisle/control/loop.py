@@ -134,6 +134,7 @@ from coldaisle.control.schema import (
     WorkloadHintStage,
     WorkloadRegime,
     Zone,
+    ZoneExcitationSkipReason,
     ZoneRecord,
     ZoneRequest,
     lowest_stage,
@@ -168,6 +169,7 @@ from coldaisle.control.supervisor.workload_hint import (
     WorkloadHintTracker,
     effective_stage,
 )
+from coldaisle.control.zone_excitation import ZoneExcitation, ZoneExcitationTemperatures
 from coldaisle.measurement import Quality, validate_metric
 from coldaisle.metrics import MetricCatalog
 
@@ -808,6 +810,9 @@ class ControlLoop:
         # Guard・Safety へは値を返さない。
         self._air_balance = AirBalanceRecorder.from_control_config(config)
         self._coordinator = self._build_coordinator(config, air_balance_coordinator)
+        # **揺らぎは Gate の後・Guard の前**（決定記録 0185 / 0186 §2.1）。`mode: "off"` でも作り、
+        # 毎 tick `state: off` の記録を返させる（v18 は記録を必須にする）。
+        self._excitation = ZoneExcitation(config.policy.zone_excitation, run_id=run_id)
 
     @property
     def tick_period_ms(self) -> int:
@@ -905,6 +910,22 @@ class ControlLoop:
         # Gate の例外の tick は、apply で上げていれば coordinated baseline（決定記録 0088 §2.1）。
         # 迂回した tick のそれは raw baseline である（決定記録 0085 §2.1）。
         requested = self._requested(mode, coordination.gate_baseline, selection)
+        # **揺らぎは Gate が Baseline を選んだ tick の requested にだけ、Guard の前で足す**
+        # （決定記録 0186 §2.1）。Gate と Shadow の記録が使う Baseline は揺らぎを含まない。
+        excitation = self._excitation.step(
+            now_mono_ms=snapshot.monotonic_ms,
+            ts_ms=ts_ms,
+            requested=requested,
+            blocked=self._excitation_blocked(
+                mode=mode,
+                selection=selection,
+                bypassed=coordination.bypass_gate,
+                safety=safety_decision,
+                guard=guard_zones,
+            ),
+            temperatures=self._excitation_temperatures(snapshot),
+        )
+        requested = excitation.requested
         composed = self._composer.compose(
             requested=requested,
             guard=guard_zones,
@@ -1006,6 +1027,8 @@ class ControlLoop:
             # **Workload Hint の塊も同じ版で毎 tick 残す**（v16。#319 / 決定記録 0133 §2.9）。
             # B0 は記録するだけで、requested には1ビットも効かない。
             workload_hint=hint_record,
+            # **揺らぎの記録を毎 tick 残す**（v18。#84 / 決定記録 0185 §2.5）。off でも載せる。
+            zone_excitation=excitation.record,
         )
         recorded, trace_failed = self._record(tick)
         # **journal の書き残しと変化の検知は heartbeat と trace の保存の後**（0072 §2.6 /
@@ -1394,6 +1417,52 @@ class ControlLoop:
                 code=FaultCode.GUARD_EXCEPTION,
                 detail=f"{type(error).__name__}: {error}"[:500],
             )
+
+    @staticmethod
+    def _excitation_blocked(
+        *,
+        mode: ModeCommand,
+        selection: ControllerSelection | None,
+        bypassed: bool,
+        safety: CriticalSafetyDecision,
+        guard: PerZone[GuardZoneOutput],
+    ) -> ZoneExcitationSkipReason | None:
+        """揺らぎの構造の条件のうち、最初に外れたもの（決定記録 0185 §2.3 / 0186 §2.1）。
+
+        時間帯と温度は ``ZoneExcitation`` が判定する。
+        """
+        if mode.mode is not OperatingMode.AUTO or mode.requested is not None:
+            return ZoneExcitationSkipReason.NOT_AUTO
+        if (
+            bypassed
+            or selection is None
+            or selection.active_controller is not ControllerKind.FALLBACK
+        ):
+            return ZoneExcitationSkipReason.NOT_BASELINE
+        if safety.state is not SafetyState.NORMAL:
+            return ZoneExcitationSkipReason.SAFETY_NOT_NORMAL
+        if safety.faults:
+            return ZoneExcitationSkipReason.FAULT_ACTIVE
+        if any(
+            guard.get(zone).floor is not None or guard.get(zone).ceiling is not None
+            for zone in Zone
+        ):
+            return ZoneExcitationSkipReason.GUARD_ACTIVE
+        return None
+
+    @staticmethod
+    def _excitation_temperatures(snapshot: ControlStateSnapshot) -> ZoneExcitationTemperatures:
+        """温度の条件（0186 §2.2）に使う値。使えない signal は None（未知を低いと読まない）。"""
+
+        def value(metric: str) -> float | None:
+            signal = snapshot.signals_by_metric.get(metric)
+            if signal is None or not signal.available or signal.value is None:
+                return None
+            return signal.value
+
+        return ZoneExcitationTemperatures(
+            cpu_c=value(CPU_TEMPERATURE_METRIC), gpu_c=value(GPU_TEMPERATURE_METRIC)
+        )
 
     @staticmethod
     def _guard_zones(decision: ReactiveGuardDecision | None) -> PerZone[GuardZoneOutput]:
