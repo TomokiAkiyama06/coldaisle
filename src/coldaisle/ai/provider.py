@@ -132,6 +132,13 @@ class SlackQaSettings(BaseModel):
     """つなぎ直すまで待つ時間の上限。"""
     idle_reconnect_s: float = Field(gt=0)
     """この間 Slack から何も受けなければ、新しい URL を取り直してつなぎ直す（0168 §2.1）。"""
+    history_turns: int = Field(ge=0)
+    """同じスレッドの直前のやり取りを、何往復まで LLM へ渡すか（0189 §2.2）。0 なら渡さない。"""
+    max_threads: int = Field(ge=1)
+    """直前のやり取りを覚えるスレッドの数の上限（0189 §2.2）。
+
+    超えたら最も古く使ったスレッドから忘れる。
+    """
 
 
 class AiSettings(BaseModel):

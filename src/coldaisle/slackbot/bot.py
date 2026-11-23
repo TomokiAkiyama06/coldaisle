@@ -1,14 +1,21 @@
-"""メンションを受け付けて答えを返す（決定記録 0168 §2.1〜§2.5）。
+"""許可したチャンネルの投稿を受け付けて答えを返す（決定記録 0168 §2.1〜§2.5 / 0189）。
 
 `offer()` は受信のスレッドから呼ぶ（ack の後）。ここでは**速く**ふるい分けて待ち行列へ積むだけで、
 答えは別のスレッド（`run_worker()`）で作り、メンションのスレッドへ `chat.postMessage` で返す。
 
 答えないもの（返事もしない。何が許可されているかを外に見せない。0168 §2.2）:
 
-- `app_mention` 以外・編集（`edited` / `subtype`）・ボットの投稿（`bot_id`）・ボット自身
+- `app_mention` / `message` 以外・編集・削除・参加など（`edited` / `subtype`）
+- ボットの投稿（`bot_id`）・ボット自身
+
+**メンションの有無は問わない**（0189 §2.1）。メンションを含む投稿は両方の event で届くが、
+(チャンネル, ts) で 1 回だけ答える。
 - DM（`D…` のチャンネル）
 - 許可リストのチャンネル**かつ**ユーザーに当たらないもの（どちらかが空なら全部）
 - 同じメンションの 2 度目（Slack の再送）・本文の空のメンション
+
+同じスレッドの直前のやり取り（受けた質問と返した答えの文）を `history_turns` 往復まで
+覚え、次の質問で LLM へ渡す（0189 §2.2）。覚えるのはプロセスのメモリだけで、Slack の履歴は読まない。
 
 **質問・答えの本文と ID はログに出さない**
 （長さ・ツールの名前・往復の数・所要時間だけ。0168 §2.5）。
@@ -21,7 +28,7 @@ import queue
 import re
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -48,6 +55,9 @@ _SEEN_LIMIT = 512
 """再送を見分けるために覚えておくメンションの数（メモリを際限なく使わない）。"""
 
 _MENTION = re.compile(r"<@[A-Z0-9]+(?:\|[^<>]*)?>")
+
+_EVENT_TYPES = frozenset({"app_mention", "message"})
+"""受ける event（0189 §2.1）。`message` は `message.channels` / `message.groups` の購読で届く。"""
 
 
 @dataclass(frozen=True)
@@ -84,6 +94,8 @@ class MentionHandler:
         self._seen_keys: OrderedDict[tuple[str, str], None] = OrderedDict()
         self._seen_ids: OrderedDict[str, None] = OrderedDict()
         self._lock = threading.Lock()
+        # (チャンネル, スレッドの ts) → 直前のやり取り。答えるスレッドだけが触る（0189 §2.2）
+        self._threads: OrderedDict[tuple[str, str], deque[tuple[str, str]]] = OrderedDict()
 
     # ------------------------------------------------------------------ 受信のスレッド
 
@@ -105,7 +117,7 @@ class MentionHandler:
             )
 
     def _screen(self, event: dict[str, Any], event_id: str | None) -> Job | None:
-        if event.get("type") != "app_mention":
+        if event.get("type") not in _EVENT_TYPES:
             return None
         if "subtype" in event or "edited" in event or "bot_id" in event or "bot_profile" in event:
             return None
@@ -132,6 +144,30 @@ class MentionHandler:
         if not self._limiter.try_acquire(user):
             return Job(kind="wait", channel=channel, thread_ts=thread_ts)
         return Job(kind="question", channel=channel, thread_ts=thread_ts, question=question)
+
+    def _history(self, key: tuple[str, str]) -> tuple[tuple[str, str], ...]:
+        """そのスレッドの直前のやり取り（古い順）。覚えていなければ空。"""
+        turns = self._threads.get(key)
+        if turns is None:
+            return ()
+        self._threads.move_to_end(key)
+        return tuple(turns)
+
+    def _remember_turn(self, key: tuple[str, str], question: str, answer: str) -> None:
+        """答えたやり取りを覚える。
+
+        `history_turns` 往復・`max_threads` スレッドを超えたら古いものから忘れる。
+        """
+        if self._settings.history_turns == 0:
+            return
+        turns = self._threads.get(key)
+        if turns is None:
+            turns = deque(maxlen=self._settings.history_turns)
+            self._threads[key] = turns
+        turns.append((question, answer))
+        self._threads.move_to_end(key)
+        while len(self._threads) > self._settings.max_threads:
+            self._threads.popitem(last=False)
 
     def _first_time(self, event_id: str | None, key: tuple[str, str]) -> bool:
         """初めて見るメンションか。
@@ -182,9 +218,11 @@ class MentionHandler:
         if job.kind == "wait":
             text = fixed(WAIT_TEXT, max_chars=limit)
         else:
-            answer = self._answerer.answer(job.question)
+            key = (job.channel, job.thread_ts)
+            answer = self._answerer.answer(job.question, self._history(key))
             if answer.kind == "answered":
                 text = compose(answer.text, verified=answer.verified, max_chars=limit)
+                self._remember_turn(key, job.question, answer.text)
             elif answer.kind == "no_answer":
                 text = fixed(NO_ANSWER_TEXT, max_chars=limit)
             else:

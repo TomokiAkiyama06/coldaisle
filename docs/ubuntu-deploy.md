@@ -349,9 +349,12 @@ Slack でボットにメンションすると（例: `@coldaisle いまの GPU �
    名前（例 `coldaisle-socket`）を付け、scope に `connections:write` だけを足して **Generate**。
    表示された **App-Level Token**（`xapp-…`）を控える（**チャットや Issue に貼らない**。あとで **Basic Information** の
    **App-Level Tokens** からも見られる）
-2. **OAuth & Permissions** の **Bot Token Scopes** に `app_mentions:read` を足す（`chat:write` は 1a で足してある。ほかは足さない）
+2. **OAuth & Permissions** の **Bot Token Scopes** に `app_mentions:read` と `channels:history` を足す
+   （非公開のチャンネルで使うなら `groups:history` も。`chat:write` は 1a で足してある。ほかは足さない。
+   `channels:history` はメンションなしの投稿を受けるため。決定記録 0189 §2.1）
 3. **Event Subscriptions** を開き、**Enable Events** を有効にする（Socket Mode なので Request URL は要らない）。
-   **Subscribe to bot events** で **Add Bot User Event** から `app_mention` だけを足し、**Save Changes**
+   **Subscribe to bot events** で **Add Bot User Event** から `app_mention` と `message.channels`（非公開のチャンネルなら
+   `message.groups` も）を足し、**Save Changes**
 4. 画面の上に出る **reinstall your app**（または **OAuth & Permissions** の **Reinstall to Workspace**）→ **許可する**。
    **Bot トークン（`xoxb-`）は変わらないことが多いですが、変わったら `COLDAISLE_SLACK_BOT_TOKEN` も置き直します**
 5. 答えさせたいチャンネルに Bot を招く（`/invite @coldaisle`）。チャンネルの **ID**（`C` で始まる）と、
@@ -382,8 +385,10 @@ sudo systemctl enable --now coldaisle-slackbot.service
 journalctl -u coldaisle-slackbot -n 20 --no-pager   # 「Slack の Socket Mode につないだ」が出れば良い
 ```
 
-許可したチャンネルで、許可したユーザーから `@coldaisle いまの GPU の温度は？` と送り、スレッドに答えが付くことを確かめます
-（1 回ぶんの上限を使う）。journal には `Slack のメンションに返した` の行に `tools`・`round_trips`・`elapsed_ms` が出ます。
+許可したチャンネルで、許可したユーザーから `いまの GPU の温度は？` と送り（メンションは要らない。決定記録 0189）、
+スレッドに答えが付くことを確かめます（1 回ぶんの上限を使う）。続けて同じスレッドで `ファンは？` と送ると、前のやり取りを
+踏まえて答えます（直前の 3 往復。ボットを再起動すると忘れる）。**許可したチャンネルの発言には、独り言にも答えます**
+（専用のチャンネルで使う）。journal には `Slack のメンションに返した` の行に `tools`・`round_trips`・`elapsed_ms` が出ます。
 
 | ログ | 意味 |
 |---|---|
@@ -395,6 +400,7 @@ journalctl -u coldaisle-slackbot -n 20 --no-pager   # 「Slack の Socket Mode �
 | `LLM へ渡さない一覧が不正なので、メンションに答えない` | `config/report.yaml` が読めない。固定の文だけを返す（0131 §2.4a） |
 | `Slack へ答えを返せなかった` の `not_in_channel` / `missing_scope` | Bot をチャンネルに招いていない（5.）・scope の不足（2.。足したら Reinstall） |
 | 何も起きない | 許可リストに当たっていない・Event Subscriptions の `app_mention` が無い（3.）・Reinstall をしていない（4.） |
+| メンションには答えるが、メンションなしには答えない | `message.channels`（3.）か `channels:history`（2.）が無い・Reinstall をしていない（4.） |
 
 止めるときは `sudo systemctl disable --now coldaisle-slackbot.service`。トークンを無効にするときは、Slack のアプリの
 **Basic Information** で App-Level Token を **Revoke** し、env から `COLDAISLE_SLACK_APP_TOKEN` の行を消します。

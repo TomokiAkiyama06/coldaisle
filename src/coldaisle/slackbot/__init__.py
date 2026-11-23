@@ -2,8 +2,10 @@
 
 #374 / 決定記録 0168。
 
-- 受け取りは Socket Mode（こちらから WebSocket でつなぐ）で `app_mention` だけ（0168 §2.1）
-- 答えるのは許可リストのチャンネル**かつ**ユーザーのメンションだけ（0168 §2.2）
+- 受け取りは Socket Mode（こちらから WebSocket でつなぐ）で `app_mention` と `message`
+  （0168 §2.1 / 0189 §2.1）
+- 答えるのは許可リストのチャンネル**かつ**ユーザーの投稿だけ。メンションの有無は問わない
+  （0168 §2.2 / 0189 §2.1）
 - LLM に渡すツールは `get_latest` / `get_stats` / `list_alerts` / `describe_system` の 4 つだけ。
   書き込み・実行の経路は無い（AGENTS.md ルール 1・2 / 0168 §2.3）
 - 生の時系列・decision trace は渡さない（ルール 8）
