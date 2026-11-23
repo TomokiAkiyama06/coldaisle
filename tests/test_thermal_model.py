@@ -1438,3 +1438,37 @@ def test_shared_gram_training_matches_the_per_head_reference(missing):
         )
         assert (output.intercept, output.coefficients) == expected
         assert output.training_samples == len(selected)
+
+
+def test_heads_are_fitted_per_row_set_and_returned_in_head_order(monkeypatch):
+    """行の集合が交互に並んでも、Gram は集合ごとに 1 回・同時に 1 つだけ作り、head の順で返す。"""
+    generator = random.Random(18701)
+    rows = tuple(tuple(generator.uniform(-2.0, 2.0) for _ in range(4)) for _ in range(12))
+    labels = tuple(generator.uniform(-1.0, 1.0) for _ in range(12))
+    first, second = tuple(range(0, 10)), tuple(range(2, 12))
+    heads = tuple(
+        training_module._HeadRows(
+            horizon_ms=1_000 * (position + 1),
+            metric="m",
+            indices=indices,
+            labels=tuple(labels[index] for index in indices),
+            width=width,
+        )
+        for position, (indices, width) in enumerate(
+            ((first, 4), (second, 4), (first, 2), (second, 3))
+        )
+    )
+    built: list[int] = []
+    original = training_module._ridge_gram
+
+    def counting(selected, *, width):
+        built.append(len(selected))
+        return original(selected, width=width)
+
+    monkeypatch.setattr(training_module, "_ridge_gram", counting)
+    fitted = training_module._fit_heads(heads, rows, ridge_lambda=0.5)
+
+    assert built == [10, 10]
+    for head, result in zip(heads, fitted, strict=True):
+        narrow = tuple(rows[index][: head.width] for index in head.indices)
+        assert result == _reference_fit_ridge(narrow, head.labels, ridge_lambda=0.5)

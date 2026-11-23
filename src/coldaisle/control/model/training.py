@@ -794,26 +794,29 @@ def _fit_heads(
 ) -> list[tuple[float, tuple[float, ...]]]:
     """head ごとの (intercept, coefficients)。行の集合が同じ head は Gram を共有する（0187 §2.1）。
 
-    ``math.fsum`` は正確に丸めるので、共有しても bytes は変わらない。最後に使う head の後で
-    捨て、同時に持つ集合を減らす。
+    ``math.fsum`` は正確に丸めるので、共有しても bytes は変わらない。行の集合ごとにまとめて解き、
+    次の集合へ進む前に捨てる。中心化した行列（件数 × 列）を同時に持つのは 1 つだけにする。
+    結果は ``heads`` の順に返す。
     """
     widths = _row_set_widths(heads)
-    last_use = {head.indices: position for position, head in enumerate(heads)}
-    grams: dict[tuple[int, ...], _RidgeGram] = {}
-    fitted: list[tuple[float, tuple[float, ...]]] = []
+    positions: dict[tuple[int, ...], list[int]] = {}
     for position, head in enumerate(heads):
-        gram = grams.get(head.indices)
-        if gram is None:
-            gram = _ridge_gram(
-                tuple(rows[index] for index in head.indices), width=widths[head.indices]
+        positions.setdefault(head.indices, []).append(position)
+    fitted: list[tuple[float, tuple[float, ...]] | None] = [None] * len(heads)
+    for indices, members in positions.items():
+        gram = _ridge_gram(tuple(rows[index] for index in indices), width=widths[indices])
+        for position in members:
+            head = heads[position]
+            fitted[position] = _fit_ridge_from_gram(
+                gram, head.labels, width=head.width, ridge_lambda=ridge_lambda
             )
-            grams[head.indices] = gram
-        fitted.append(
-            _fit_ridge_from_gram(gram, head.labels, width=head.width, ridge_lambda=ridge_lambda)
-        )
-        if last_use[head.indices] == position:
-            del grams[head.indices]
-    return fitted
+        del gram
+    result: list[tuple[float, tuple[float, ...]]] = []
+    for item in fitted:
+        if item is None:
+            raise RuntimeError("当てはめていない head が残った")
+        result.append(item)
+    return result
 
 
 def _ridge_gram(rows: tuple[tuple[float, ...], ...], *, width: int) -> _RidgeGram:
