@@ -28,7 +28,11 @@ from coldaisle.control import (
     ZoneRecord,
 )
 from coldaisle.control.config import SupervisorConfig
-from coldaisle.control.schema import SupervisorPolicyIdentity, WorkloadHintRecord
+from coldaisle.control.schema import (
+    SupervisorPolicyIdentity,
+    WorkloadHintRecord,
+    ZoneExcitationRecord,
+)
 from coldaisle.control.state import ControlStateSnapshot, TelemetryHealth
 from coldaisle.control.supervisor import (
     ReceivedSupervisorOutput,
@@ -639,6 +643,7 @@ def control_tick(decision: SupervisorDecision, current: SupervisorInput) -> Cont
         telemetry_health=TELEMETRY_HEALTH_RECORD,
         run_id=TRACE_RUN_ID,
         workload_hint=WorkloadHintRecord.off(),
+        zone_excitation=ZoneExcitationRecord.off(),
     )
 
 
@@ -687,6 +692,7 @@ def test_decision_can_be_embedded_in_v3_control_trace_with_shadow_output() -> No
         telemetry_health=TELEMETRY_HEALTH_RECORD,
         run_id=TRACE_RUN_ID,
         workload_hint=WorkloadHintRecord.off(),
+        zone_excitation=ZoneExcitationRecord.off(),
     )
 
     # v3 で Supervisor decision を追加した。以後の版（v4: #78 の fault code）でもそのまま載る。

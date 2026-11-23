@@ -62,6 +62,7 @@ from coldaisle.control.schema import (
     TelemetryHealth,
     TelemetryHealthRecord,
     WorkloadHintRecord,
+    ZoneExcitationRecord,
     registry_reason_sha256,
 )
 
@@ -597,6 +598,10 @@ AUTHORITY_RECORD = AuthorityRecord(entry="static", config_ceiling=AuthorityStage
 
 設定の上限を `full` にして、どの試験の stage も上限を超えないようにする。
 """
+AUTHORITY_RECORD_V1 = AuthorityRecord(
+    schema_version=1, entry="static", config_ceiling=AuthorityStage.FULL
+)
+"""v13〜v17 の `ControlTick` の制御権の出どころ（`AuthorityRecord` v1。v18 から v2）。"""
 
 
 def runtime_for(schema_version: int) -> ControlTickRuntime | None:
@@ -673,6 +678,7 @@ def tick(demand: EffectiveZoneDemand, faults=(), **state_overrides) -> ControlTi
         telemetry_health=TELEMETRY_HEALTH_RECORD,
         run_id=TRACE_RUN_ID,
         workload_hint=WorkloadHintRecord.off(),
+        zone_excitation=ZoneExcitationRecord.off(),
     )
 
 
@@ -791,6 +797,7 @@ def test_a_front_or_rear_stall_can_stay_degraded():
         telemetry_health=TELEMETRY_HEALTH_RECORD,
         run_id=TRACE_RUN_ID,
         workload_hint=WorkloadHintRecord.off(),
+        zone_excitation=ZoneExcitationRecord.off(),
     )
     assert recorded.state.safety_state is SafetyState.DEGRADED
 
@@ -828,6 +835,7 @@ def test_stale_cpu_temperature_drives_top_to_max():
         telemetry_health=TELEMETRY_HEALTH_RECORD,
         run_id=TRACE_RUN_ID,
         workload_hint=WorkloadHintRecord.off(),
+        zone_excitation=ZoneExcitationRecord.off(),
     )
     assert recorded.zones.top.demand.forced_max
 
@@ -844,7 +852,7 @@ def test_the_stored_v1_record_still_loads_unchanged():
     stored = FIXTURE.read_text(encoding="utf-8")
     tick = ControlTick.model_validate_json(stored)
     assert tick.schema_version == 1
-    assert SCHEMA_VERSION == 17
+    assert SCHEMA_VERSION == 18
     assert json.loads(tick.model_dump_json()) == json.loads(stored)
 
 
@@ -921,6 +929,7 @@ def test_current_trace_stores_workload_regime_and_confidence_together():
         telemetry_health=TELEMETRY_HEALTH_RECORD,
         run_id=TRACE_RUN_ID,
         workload_hint=WorkloadHintRecord.off(),
+        zone_excitation=ZoneExcitationRecord.off(),
     )
 
     payload = json.loads(recorded.model_dump_json())
@@ -961,6 +970,7 @@ def test_v2_trace_keeps_simultaneous_transient_load_distinct():
         telemetry_health=TELEMETRY_HEALTH_RECORD,
         run_id=TRACE_RUN_ID,
         workload_hint=WorkloadHintRecord.off(),
+        zone_excitation=ZoneExcitationRecord.off(),
     )
 
     payload = json.loads(recorded.model_dump_json())
@@ -986,6 +996,7 @@ def test_fallback_trace_remains_valid_when_regime_is_not_available():
         telemetry_health=TELEMETRY_HEALTH_RECORD,
         run_id=TRACE_RUN_ID,
         workload_hint=WorkloadHintRecord.off(),
+        zone_excitation=ZoneExcitationRecord.off(),
     )
 
     assert recorded.schema_version == SCHEMA_VERSION
@@ -1039,6 +1050,7 @@ def test_v3_supervisor_policy_requires_a_matching_decision():
             telemetry_health=TELEMETRY_HEALTH_RECORD,
             run_id=TRACE_RUN_ID,
             workload_hint=WorkloadHintRecord.off(),
+            zone_excitation=ZoneExcitationRecord.off(),
         )
 
 
@@ -1156,6 +1168,7 @@ def test_the_v9_trace_keeps_disabled_inputs_and_the_provisional_flag():
         telemetry_health=TELEMETRY_HEALTH_RECORD,
         run_id=TRACE_RUN_ID,
         workload_hint=WorkloadHintRecord.off(),
+        zone_excitation=ZoneExcitationRecord.off(),
     )
     payload = json.loads(recorded.model_dump_json())
     assert payload["schema_version"] == SCHEMA_VERSION
@@ -1234,6 +1247,7 @@ def registry_tick(registry: RegistryProvenance, **overrides: object) -> ControlT
         "telemetry_health": TELEMETRY_HEALTH_RECORD,
         "run_id": TRACE_RUN_ID,
         "workload_hint": WorkloadHintRecord.off(),
+        "zone_excitation": ZoneExcitationRecord.off(),
     }
     return ControlTick(**(values | overrides))
 
@@ -1243,7 +1257,7 @@ def test_a_v10_tick_round_trips_the_registry_pointer_it_used():
     recorded = registry_tick(bound_registry())
 
     payload = json.loads(recorded.model_dump_json())
-    assert payload["schema_version"] == SCHEMA_VERSION == 17
+    assert payload["schema_version"] == SCHEMA_VERSION == 18
     assert payload["registry"]["revision"] == 3
     thermal = payload["registry"]["production"]["thermal_model"]
     assert thermal["artifact_sha256"] == REGISTRY_SHA
@@ -1599,10 +1613,14 @@ def learned_tick(**overrides) -> ControlTick:
         # v16 を名乗る記録は fand の起動ごとの run_id を省けない（#288 / 決定記録 0133 §2.9）。
         "run_id": TRACE_RUN_ID,
         "workload_hint": WorkloadHintRecord.off(),
+        "zone_excitation": ZoneExcitationRecord.off(),
     }
     version = overrides.get("schema_version", SCHEMA_VERSION)
     assert isinstance(version, int)
     values["runtime"] = runtime_for(version)
+    if version < 18:
+        values.pop("zone_excitation")
+        values["authority"] = AUTHORITY_RECORD_V1
     if version < 16:
         values.pop("run_id")
         values.pop("workload_hint")
@@ -1820,6 +1838,7 @@ def test_a_tick_cannot_claim_two_different_artifacts():
             telemetry_health=TELEMETRY_HEALTH_RECORD,
             run_id=TRACE_RUN_ID,
             workload_hint=WorkloadHintRecord.off(),
+            zone_excitation=ZoneExcitationRecord.off(),
             state=fallback_state(
                 authority_stage=AuthorityStage.LIMITED,
                 fallback_reason=Reason(code="low_confidence"),
@@ -1922,7 +1941,7 @@ def test_a_v15_tick_round_trips_the_telemetry_health():
     recorded = registry_tick(REGISTRY_PROVENANCE, telemetry_health=record)
 
     payload = json.loads(recorded.model_dump_json())
-    assert payload["schema_version"] == SCHEMA_VERSION == 17
+    assert payload["schema_version"] == SCHEMA_VERSION == 18
     assert payload["telemetry_health"] == {
         "schema_version": 1,
         "health": "degraded",
@@ -1947,7 +1966,13 @@ def test_a_v14_tick_reads_without_the_telemetry_health_but_cannot_carry_it():
     assert json.loads(tick.model_dump_json()) == stored
 
     with pytest.raises(ValidationError, match="schema version 15"):
-        registry_tick(REGISTRY_PROVENANCE, schema_version=14)
+        # v18 の欄（揺らぎ・authority v2）は外し、v15 の欄だけが余る形にする
+        registry_tick(
+            REGISTRY_PROVENANCE,
+            schema_version=14,
+            authority=AUTHORITY_RECORD_V1,
+            zone_excitation=None,
+        )
 
 
 @pytest.mark.parametrize(
@@ -2016,6 +2041,7 @@ def test_a_missing_guard_profile_needs_the_guard_exception():
         telemetry_health=without_guard,
         run_id=TRACE_RUN_ID,
         workload_hint=WorkloadHintRecord.off(),
+        zone_excitation=ZoneExcitationRecord.off(),
     )
     assert recorded.telemetry_health is not None
     assert recorded.telemetry_health.guard_threshold_profile is None
@@ -2037,7 +2063,7 @@ def test_a_v16_tick_round_trips_the_run_id():
     recorded = registry_tick(REGISTRY_PROVENANCE)
 
     payload = json.loads(recorded.model_dump_json())
-    assert payload["schema_version"] == SCHEMA_VERSION == 17
+    assert payload["schema_version"] == SCHEMA_VERSION == 18
     assert payload["run_id"] == TRACE_RUN_ID
     assert ControlTick.model_validate_json(recorded.model_dump_json()) == recorded
 
@@ -2059,7 +2085,13 @@ def test_a_v15_tick_reads_without_the_run_id_but_cannot_carry_it():
     assert "run_id" not in json.loads(tick.model_dump_json())
 
     with pytest.raises(ValidationError, match="schema version 16"):
-        registry_tick(REGISTRY_PROVENANCE, schema_version=15)
+        # v18 の欄（揺らぎ・authority v2）は外し、v16 の欄だけが余る形にする
+        registry_tick(
+            REGISTRY_PROVENANCE,
+            schema_version=15,
+            authority=AUTHORITY_RECORD_V1,
+            zone_excitation=None,
+        )
 
 
 def test_the_run_id_must_match_the_mode_command():

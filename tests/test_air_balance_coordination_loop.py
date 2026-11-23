@@ -207,7 +207,7 @@ def round_trip(tick: ControlTick) -> ControlTick:
 def test_off_records_off_and_copies_the_unconfirmed_tach(catalog: MetricCatalog) -> None:
     harness = Harness(catalog, config=coordination_config("off"))
     first = harness.tick().tick
-    assert first.schema_version == 17
+    assert first.schema_version == 18
     assert record_of(first) == AirBalanceCoordinationRecord.off()
     # 引き継ぎ直後の STARTUP は tach の応答をまだ見ていない（timer が動いている）。
     assert first.tach_unconfirmed_zones == (Zone.FRONT, Zone.REAR, Zone.TOP)
@@ -1023,6 +1023,9 @@ def test_unconfirmed_tach_must_be_sorted_and_explain_the_skip(catalog: MetricCat
 def test_a_v13_tick_cannot_carry_the_coordination(catalog: MetricCatalog) -> None:
     document = _applied_document(catalog)
     document["schema_version"] = 13
+    # v18 の欄（揺らぎ・authority v2）は外し、協調の欄だけが余る形にする
+    document.pop("zone_excitation")
+    document["authority"]["schema_version"] = 1
     with pytest.raises(ValidationError, match="schema version 14"):
         _validate(document)
     del document["air_balance_coordination"]

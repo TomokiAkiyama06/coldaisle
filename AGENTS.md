@@ -316,6 +316,7 @@ src/coldaisle/
     air_balance.py       # Air Balance Model と air-balance.yaml（v2）の形。Safety ではない。#81
     air_balance_trace.py # applied demand から Air Balance を trace へ記録するだけ（制御へ効かない）。#81 / 決定記録 0073
     air_balance_coordination.py # Baseline（Fallback）の requested への Air Balance の協調（上げるだけ・max_raise・保持。Gate の前・合成の前）。#81 / 決定記録 0078 / 0085
+    zone_excitation.py # 普段の運転の揺らぎ（1 つの zone だけ上げるだけ・決定論的な予定・時間帯と温度の条件）。Gate が Baseline を選んだ tick の requested に、Guard の前で掛ける。#84 / 決定記録 0185 / 0186
     supervisor/ # RulePolicy / RLPolicy / Workload Regime / Workload Hint の状態の遷移（B0。DB を開かない。#319）
     model/      # Learned Thermal Model、Confidence / OOD
     mpc/        # Optimizer / horizon制御
