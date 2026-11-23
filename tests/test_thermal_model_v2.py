@@ -17,6 +17,7 @@ from pydantic import BaseModel, ValidationError
 
 import coldaisle.control.model.counterfactual as counterfactual_module
 import coldaisle.control.model.counterfactual_training as training_v2_module
+import coldaisle.control.model.training as training_module_v1
 import coldaisle.control.model_registry as registry_module
 from coldaisle.clock import SimulatedClock
 from coldaisle.control.model.calibration_digest import RuntimeCalibration
@@ -1429,3 +1430,65 @@ def test_new_model_modules_stay_upstream_of_guard_safety_and_hardware() -> None:
             assert f"import {token}" not in source, (module.__name__, token)
             assert f"from coldaisle.{token}" not in source, (module.__name__, token)
         assert "coldaisle.ai" not in source
+
+
+# ------------------------------------------------ Gram の共有と ridge の上限（決定記録 0187）
+
+
+def _reference_fit_heads(
+    heads: Any, rows: tuple[tuple[float, ...], ...], *, ridge_lambda: float
+) -> list[tuple[float, tuple[float, ...]]]:
+    """0187 の前の当てはめ（head ごとに列を切り、Gram の全要素を作り直す）。"""
+    fitted = []
+    for head in heads:
+        selected = tuple(rows[index][: head.width] for index in head.indices)
+        width = head.width
+        label_mean = math.fsum(head.labels) / len(head.labels)
+        means = tuple(math.fsum(row[c] for row in selected) / len(selected) for c in range(width))
+        centered = tuple(tuple(v - means[c] for c, v in enumerate(row)) for row in selected)
+        labels = tuple(label - label_mean for label in head.labels)
+        gram = [
+            [math.fsum(row[left] * row[right] for row in centered) for right in range(width)]
+            for left in range(width)
+        ]
+        for index in range(width):
+            gram[index][index] += ridge_lambda
+        rhs = [
+            math.fsum(row[c] * label for row, label in zip(centered, labels, strict=True))
+            for c in range(width)
+        ]
+        coefficients = training_module_v1._solve_linear_system(gram, rhs)
+        intercept = label_mean - math.fsum(
+            coefficient * mean for coefficient, mean in zip(coefficients, means, strict=True)
+        )
+        fitted.append((intercept, coefficients))
+    return fitted
+
+
+def test_shared_gram_gives_the_same_artifact_as_per_head_fitting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """因果の mask で列が horizon ごとに違っても、共有した Gram の先頭で解けば bit まで同じ。"""
+    shared = train(tmp_path / "shared")
+    monkeypatch.setattr(training_v2_module, "_fit_heads", _reference_fit_heads)
+    reference = train(tmp_path / "reference")
+    assert shared == reference
+    # horizon で因果の列の数が違う（1 s は step 1 の計画を落とす）
+    assert causal_plan_steps(shared.action_schema, 1_000) != causal_plan_steps(
+        shared.action_schema, 2_000
+    )
+
+
+def test_ridge_work_limit_rejects_before_preprocessing_and_fit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Dataset v2 の学習も、前処理と Gram の前に ridge の演算量で止まる（0187 §2.2）。"""
+    monkeypatch.setattr(training_module_v1, "MAX_RIDGE_WORK_UNITS", 1)
+
+    def unexpected(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("must not run beyond the ridge work budget")
+
+    monkeypatch.setattr(training_v2_module, "_fit_preprocessing", unexpected)
+    monkeypatch.setattr(training_module_v1, "_ridge_gram", unexpected)
+    with pytest.raises(ValueError, match="ridge演算量"):
+        train(tmp_path)

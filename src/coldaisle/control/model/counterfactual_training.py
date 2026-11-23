@@ -83,17 +83,18 @@ from coldaisle.control.model.training import (
     MAX_DATASET_EXAMPLES_BYTES,
     MAX_DATASET_MANIFEST_BYTES,
     _example_order,
+    _fit_heads,
     _fit_preprocessing,
-    _fit_ridge,
     _hash_regular_file_at,
     _open_directory_without_symlinks,
     _read_regular_file_at,
+    _select_head_rows,
+    _validate_heads_ridge_work,
     _validate_split,
     _validate_training_resource_limits,
     split_sha256,
 )
 from coldaisle.control.schema import AuthorityStage, PerZone
-from coldaisle.measurement import Quality
 from coldaisle.metrics import MetricCatalog
 
 _DATASET_ARTIFACT_ALIAS = re.compile(r"^dataset-[0-9a-f]{32}$")
@@ -426,6 +427,15 @@ def train_counterfactual_ridge(
     )
 
     train_examples = tuple(sorted(split.train, key=_example_order))
+    plan_start = len(feature_schema.columns) - action_schema.steps * len(ZONE_ORDER)
+
+    def causal_width(horizon: int) -> int:
+        # 因果の mask: horizon より後の step の計画 action の列は落として当てはめる（0079 §2.3）
+        return plan_start + causal_plan_steps(action_schema, horizon) * len(ZONE_ORDER)
+
+    heads = _select_head_rows(train_examples, target_schema, width=causal_width)
+    # 前処理と Gram の前に、実際の計算の量を上限と比べる（0187 §2.2）
+    _validate_heads_ridge_work(heads)
     raw_rows = tuple(
         feature_row_v2(
             ObservedThermalInput.from_example_v2(example),
@@ -436,38 +446,19 @@ def train_counterfactual_ridge(
         for example in train_examples
     )
     means, scales, observed_counts, rows = _fit_preprocessing(raw_rows)
-    plan_start = len(feature_schema.columns) - action_schema.steps * len(ZONE_ORDER)
 
-    outputs: list[RidgeOutput] = []
-    for horizon in target_schema.horizons_ms:
-        # 因果の mask: horizon より後の step の計画 action の列は落として当てはめる（0079 §2.3）
-        kept = plan_start + causal_plan_steps(action_schema, horizon) * len(ZONE_ORDER)
-        for metric in target_schema.metrics:
-            selected_rows: list[tuple[float, ...]] = []
-            labels: list[float] = []
-            for example, row in zip(train_examples, rows, strict=True):
-                target = next(item for item in example.targets if item.horizon_ms == horizon)
-                value = target.values[metric]
-                if target.quality[metric] is not Quality.OK or value is None:
-                    continue
-                selected_rows.append(row[:kept])
-                labels.append(value)
-            if not labels:
-                raise ValueError(
-                    f"観測済み label が無いため学習できない: horizon={horizon}, metric={metric}"
-                )
-            intercept, coefficients = _fit_ridge(
-                tuple(selected_rows), tuple(labels), ridge_lambda=training.ridge_lambda
-            )
-            outputs.append(
-                RidgeOutput(
-                    horizon_ms=horizon,
-                    metric=metric,
-                    intercept=intercept,
-                    coefficients=coefficients + (0.0,) * (len(feature_schema.columns) - kept),
-                    training_samples=len(labels),
-                )
-            )
+    outputs = [
+        RidgeOutput(
+            horizon_ms=head.horizon_ms,
+            metric=head.metric,
+            intercept=intercept,
+            coefficients=coefficients + (0.0,) * (len(feature_schema.columns) - head.width),
+            training_samples=len(head.labels),
+        )
+        for head, (intercept, coefficients) in zip(
+            heads, _fit_heads(heads, rows, ridge_lambda=training.ridge_lambda), strict=True
+        )
+    ]
 
     payload = RidgeModelPayload(
         feature_means=means,

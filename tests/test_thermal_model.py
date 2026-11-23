@@ -1251,9 +1251,23 @@ def test_dataset_target_cells_at_the_limit_pass_and_beyond_are_refused(check_lim
 
 
 def _ridge_work(*, row_sets: tuple[int, ...], heads: tuple[int, ...], columns: int) -> int:
-    """0187 §2.2 の数え方（試験の側で独立に書く）。"""
+    """0187 §2.2 の数え方（試験の側で独立に書く。列の数はすべて同じ）。"""
     gram = sum(rows * columns * (columns + 1) // 2 for rows in row_sets)
     return gram + sum(rows * columns + columns**3 for rows in heads)
+
+
+def _heads(*specs: tuple[int, int, int]) -> tuple[training_module._HeadRows, ...]:
+    """(行の集合の番号, 件数, 列の数) の head。番号が同じなら同じ行の集合になる。"""
+    return tuple(
+        training_module._HeadRows(
+            horizon_ms=1_000,
+            metric=f"m{position}",
+            indices=tuple(range(offset, offset + rows)),
+            labels=(),
+            width=width,
+        )
+        for position, (offset, rows, width) in enumerate(specs)
+    )
 
 
 def test_ridge_work_at_the_limit_passes_and_beyond_is_refused():
@@ -1267,33 +1281,59 @@ def test_ridge_work_at_the_limit_passes_and_beyond_is_refused():
     assert _ridge_work(row_sets=(rows + 1,), heads=(rows + 1,), columns=columns) > (
         training_module.MAX_RIDGE_WORK_UNITS
     )
-    training_module._validate_ridge_work(
-        row_set_sizes=(rows,), head_sizes=(rows,), feature_count=columns
-    )
+    training_module._validate_heads_ridge_work(_heads((0, rows, columns)))
     with pytest.raises(ValueError, match="ridge演算量"):
-        training_module._validate_ridge_work(
-            row_set_sizes=(rows + 1,), head_sizes=(rows + 1,), feature_count=columns
-        )
+        training_module._validate_heads_ridge_work(_heads((0, rows + 1, columns)))
 
 
 def test_ridge_work_counts_each_shared_row_set_once():
     """行の集合が同じ head は Gram を 1 回だけ数え、掃き出しは head ごとに数える（0187 §2.2）。"""
     columns = 263
     # 試行 13 の形: head 9 つ・行の集合 2 つ（約 22,000 行）は上限の内側
-    training_module._validate_ridge_work(
-        row_set_sizes=(22_166, 22_160),
-        head_sizes=(22_166,) * 6 + (22_160,) * 3,
-        feature_count=columns,
+    training_module._validate_heads_ridge_work(
+        _heads(*((0, 22_166, columns),) * 6, *((1, 22_160, columns),) * 3)
     )
     # 同じ件数でも、行の集合が head ごとに全部違えば Gram を 9 回数え、上限を超える
     with pytest.raises(ValueError, match="ridge演算量"):
-        training_module._validate_ridge_work(
-            row_set_sizes=(70_000,) * 9,
-            head_sizes=(70_000,) * 9,
-            feature_count=columns,
+        training_module._validate_heads_ridge_work(
+            _heads(*((offset, 70_000, columns) for offset in range(9)))
         )
+    training_module._validate_heads_ridge_work(_heads(*((0, 70_000, columns),) * 9))
     shared = _ridge_work(row_sets=(70_000,), heads=(70_000,) * 9, columns=columns)
     assert shared <= training_module.MAX_RIDGE_WORK_UNITS
+
+
+def test_shared_gram_is_counted_at_the_widest_head_of_the_row_set():
+    """因果の mask で列が head ごとに違うとき、共有する Gram は最大の列の数で数える。"""
+    narrow, wide = 100, 400
+    rows = 1_000
+    heads = _heads((0, rows, narrow), (0, rows, wide))
+    expected = rows * wide * (wide + 1) // 2 + sum(
+        rows * width + width**3 for width in (narrow, wide)
+    )
+    assert training_module._row_set_widths(heads) == {tuple(range(rows)): wide}
+    original = training_module.MAX_RIDGE_WORK_UNITS
+    try:
+        training_module.MAX_RIDGE_WORK_UNITS = expected
+        training_module._validate_heads_ridge_work(heads)
+        training_module.MAX_RIDGE_WORK_UNITS = expected - 1
+        with pytest.raises(ValueError, match="ridge演算量"):
+            training_module._validate_heads_ridge_work(heads)
+    finally:
+        training_module.MAX_RIDGE_WORK_UNITS = original
+
+
+def test_prefix_of_a_shared_gram_gives_the_same_bits_as_a_narrow_gram():
+    """先頭 k 列で解くと、k 列だけで作った Gram と bit まで同じ（因果の mask の共有）。"""
+    generator = random.Random(1870)
+    rows = tuple(tuple(generator.uniform(-3.0, 3.0) for _ in range(9)) for _ in range(30))
+    labels = tuple(generator.uniform(-5.0, 5.0) for _ in range(30))
+    shared = training_module._ridge_gram(rows, width=9)
+    for width in (3, 6, 9):
+        narrow = tuple(row[:width] for row in rows)
+        assert training_module._fit_ridge_from_gram(
+            shared, labels, width=width, ridge_lambda=0.5
+        ) == _reference_fit_ridge(narrow, labels, ridge_lambda=0.5)
 
 
 # ------------------------------------------------- Gram の共有（決定記録 0187 §2.1）
