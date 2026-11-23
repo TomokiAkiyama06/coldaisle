@@ -109,6 +109,8 @@ from coldaisle.control.config import (
     WorkloadPolicyContexts,
     WorkloadPowerBand,
     WorkloadRegimeConfig,
+    ZoneExcitationConfig,
+    ZoneExcitationMode,
 )
 from coldaisle.control.fallback import (
     ControllerGate,
@@ -701,6 +703,8 @@ __all__ = [
     "Zone",
     "ZoneAcousticCurve",
     "ZoneBound",
+    "ZoneExcitationConfig",
+    "ZoneExcitationMode",
     "ZoneFlowCurve",
     "ZoneFlowEstimate",
     "ZoneRecord",

@@ -168,7 +168,7 @@ def policy(
     mpc: dict[str, object] | None = None,
 ) -> FanPolicyConfig:
     document: dict[str, object] = {
-        "schema_version": 13,
+        "schema_version": 14,
         "fallback_curve": [
             {"temperature_c": 20.0, "demand": 0.2},
             {"temperature_c": 80.0, "demand": 0.8},
@@ -275,6 +275,18 @@ def policy(
                 "top": provisional(0.0),
             },
             "release_hold_ms": provisional(0),
+        },
+        "zone_excitation": {
+            "mode": "off",
+            "zones": ["front", "rear", "top"],
+            "amplitude": provisional(0.10),
+            "on_ms": provisional(300_000),
+            "off_min_ms": provisional(600_000),
+            "off_max_ms": provisional(1_200_000),
+            "cpu_max_c": provisional(80.0),
+            "gpu_max_c": provisional(77.0),
+            "allowed_hours": {"value": [0, 24], "status": "provisional"},
+            "seed": 1,
         },
         "recovery_hold_ms": recovery_hold_ms,
         "demote_window_ms": demote_window_ms,
