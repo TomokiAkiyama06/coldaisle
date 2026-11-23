@@ -3,6 +3,7 @@
 - **種別**: Decision Record
 - **Status**: FINAL（2026-10-23、リポジトリ所有者の承認。§5 の 1〜8 はすべて推奨の案）
 - **Date**: 2026-10-23
+- **Superseded by**: [`0189`](0189-slackbot-without-mention.md)（§2.1 の `app_mention` だけを受ける点と scope・event、§2.2 のメンションの条件、§2.3 の質問ごとに独立して答える点だけ。ほかは有効）
 - **Supersedes**: [`0001`](0001-initial-project-decisions.md) D-06（「AI チャット UI は実装しない」）のうち、**Slack のメンションへの返答に限って**
   coldaisle が会話の受け口を持つことを認める部分のみ（Web の チャット UI は作らないまま。ツールを使う会話の正は Workspace のまま）/
   [`0143`](0143-claude-api-interim-provider.md) §2.3 の「ツールは送らない」のうち、本記録の経路に限ってツールの定義と結果を送る部分のみ
