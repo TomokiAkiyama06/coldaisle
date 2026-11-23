@@ -256,3 +256,4 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0186](0186-zone-excitation-after-gate.md) | 揺らぎ（0185）を Gate の後・Reactive Guard の前に掛け、Gate が Baseline を選んだ tick だけにする。温度の条件は `zone_excitation` の `cpu_max_c` / `gpu_max_c` で書く（試験の手順の値は設定に無いため）。 | FINAL |
 | [0187](0187-ridge-shared-gram.md) | ridge の Gram 行列を、label を使う行の集合が同じ出力で共有し、対称の半分だけ計算する。上限 `MAX_RIDGE_WORK_UNITS` の値（2 × 10¹⁰）は変えず、数え方を実際の計算に合わせる。列 263 で train が約 2 週間分で上限に当たり、揺らぎの週を学習に足せないため（#84）。 | FINAL |
 | [0188](0188-opt-update-zone-excitation.md) | `/opt/coldaisle` を `f706c6c` から揺らぎ（0185 / 0186）の入った main へ更新する確認（区分 S）。T3 の短い回と R1〜R3 を `mode: "off"` で行い、`fan-policy.yaml` を v14 に組で書き換える。合格の後に apply へ進め、最初の 1 時間を確かめてから 1 週間運転する（#74 / #84）。 | FINAL |
+| [0189](0189-slackbot-without-mention.md) | Slack のボットが、許可したチャンネル・ユーザーの投稿にメンションなしで答え、同じスレッドの直前の 3 往復（ボットが受け返した文だけ・メモリに再起動まで）を踏まえる。0168 の受け取りの event とメンションの条件を置き換える（#374）。 | FINAL |
