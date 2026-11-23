@@ -56,6 +56,8 @@ Slack で聞かれたことに、ツールで得た値だけを使って答え�
 - 期間は get_stats の window（例: 1h / 24h / 7d）か、
   list_alerts の from / to（Unix ミリ秒）で指定する
 - ユーザーへの言及・@channel・リンクを書かない
+- 前のやり取りがあれば話の続きとして読む。ただし前の答えの数値は古いので、
+  数値はツールで取り直してから答える
 """
 
 
@@ -97,14 +99,18 @@ class QuestionAnswerer:
     """現在時刻（system の指示に入れる）。`coldaisle.clock` から取る（#42）。"""
     _tools: ToolRegistry | None = field(default=None, init=False, repr=False)
 
-    def answer(self, question: str) -> Answer:
-        """質問に答える。**例外を上へ投げない**（受信のループを巻き込まない）。"""
+    def answer(self, question: str, history: tuple[tuple[str, str], ...] = ()) -> Answer:
+        """質問に答える。**例外を上へ投げない**（受信のループを巻き込まない）。
+
+        `history` は同じスレッドの直前のやり取り（質問の文, 返した答えの文）。
+        古い順に並ぶ（0189 §2.2）。
+        """
         if self.open_tools is None:
             return Answer(kind="unavailable", reason="LLM へ渡さない一覧が読めない")
         try:
             if self._tools is None:
                 self._tools = self.open_tools()
-            return self._loop(self._tools, question)
+            return self._loop(self._tools, question, history)
         except Exception as error:
             LOGGER.warning(
                 "Slack の質問に答える途中で失敗した",
@@ -112,12 +118,19 @@ class QuestionAnswerer:
             )
             return Answer(kind="unavailable", reason=type(error).__name__)
 
-    def _loop(self, tools: ToolRegistry, question: str) -> Answer:
+    def _loop(
+        self, tools: ToolRegistry, question: str, history: tuple[tuple[str, str], ...] = ()
+    ) -> Answer:
         system = f"{SYSTEM_PROMPT}\n{time_basis(self.clock.now_ms(), self.zone)}\n\n{GUIDANCE}"
-        messages = [
-            ChatMessage(role="system", content=system),
-            ChatMessage(role="user", content=question[: self.settings.max_question_chars]),
-        ]
+        messages = [ChatMessage(role="system", content=system)]
+        for asked, answered in history:
+            messages.append(
+                ChatMessage(role="user", content=asked[: self.settings.max_question_chars])
+            )
+            messages.append(ChatMessage(role="assistant", content=answered))
+        messages.append(
+            ChatMessage(role="user", content=question[: self.settings.max_question_chars])
+        )
         allowed: set[float] = set()
         used: list[str] = []
         round_trips = 0

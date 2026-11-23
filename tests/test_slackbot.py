@@ -231,7 +231,9 @@ def test_only_the_four_read_only_tools_are_offered():
         mention(subtype="message_changed"),
         mention(channel="D0000DM000"),  # DM
         mention(channel_type="im"),
-        mention(type="message"),  # app_mention 以外
+        mention(type="reaction_added"),  # app_mention / message 以外
+        mention(type="message", subtype="channel_join"),  # 参加などの subtype
+        mention(type="message", subtype="message_deleted"),
         mention(text=f"<@{BOT}>"),  # 本文が空
     ],
 )
@@ -1590,3 +1592,152 @@ def test_an_unreadable_tool_config_exits_with_the_config_code(
     with caplog.at_level(logging.ERROR):
         assert cli.main(["--ai", str(CONFIG_DIR / "ai.yaml"), flag, str(path)]) == cli.EXIT_CONFIG
     assert BOT_TOKEN not in caplog.text and APP_TOKEN not in caplog.text
+
+
+# ------------------------------------------- メンションなし・スレッドの文脈（決定記録 0189）
+
+
+def message(**overrides) -> dict:
+    event = {
+        "type": "message",
+        "channel_type": "channel",
+        "user": OWNER,
+        "channel": CHANNEL,
+        "ts": "1787616000.000200",
+        "text": "いまの GPU の吸気は？",
+    }
+    event.update(overrides)
+    return event
+
+
+def test_a_message_without_a_mention_is_answered(qa_settings, store):
+    """許可リストのチャンネルの普通の投稿にも答え、その投稿のスレッドへ返す（0189 §2.1）。"""
+    provider = ScriptedProvider(ChatResult(available=True, text="22 ℃ です。"))
+    posted = Posted()
+    target = handler(qa_settings, provider, store, post=posted)
+    target.offer(message())
+    drain(target)
+    assert len(posted.items) == 1
+    assert posted.items[0][:2] == (CHANNEL, "1787616000.000200")
+
+
+def test_a_thread_reply_without_a_mention_goes_to_the_same_thread(qa_settings, store):
+    provider = ScriptedProvider(ChatResult(available=True, text="はい"))
+    posted = Posted()
+    target = handler(qa_settings, provider, store, post=posted)
+    target.offer(message(ts="1787616100.000300", thread_ts="1787616000.000200"))
+    drain(target)
+    assert [(c, t) for c, t, _ in posted.items] == [(CHANNEL, "1787616000.000200")]
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        message(user=STRANGER),
+        message(channel=OTHER_CHANNEL),
+        message(bot_id="B0000OTHER"),
+        message(user=BOT),
+        message(channel="D0000DM000", channel_type="im"),
+        message(subtype="message_changed"),
+        message(text="   "),
+    ],
+)
+def test_messages_outside_the_rules_are_ignored(qa_settings, event):
+    provider = ScriptedProvider(ChatResult(available=True, text="x"))
+    posted = Posted()
+    target = handler(qa_settings, provider, post=posted)
+    target.offer(event)
+    drain(target)
+    assert posted.items == []
+    assert provider.requests == []
+
+
+def test_a_mention_delivered_as_both_events_is_answered_once(qa_settings, store):
+    """メンションを含む投稿は app_mention と message の両方で届く。
+
+    (チャンネル, ts) で 1 回だけ答える。
+    """
+    provider = ScriptedProvider(ChatResult(available=True, text="はい"))
+    posted = Posted()
+    target = handler(qa_settings, provider, store, post=posted)
+    target.offer(mention(ts="1787616000.000900"), {"event_id": "Ev1"})
+    target.offer(
+        message(ts="1787616000.000900", text=f"<@{BOT}> いまの GPU の吸気は？"), {"event_id": "Ev2"}
+    )
+    drain(target)
+    assert len(posted.items) == 1
+
+
+def _users(provider: ScriptedProvider, index: int) -> list[tuple[str, str]]:
+    return [
+        (m.role, m.content)
+        for m in provider.requests[index]["messages"]
+        if m.role in ("user", "assistant")
+    ]
+
+
+def test_the_previous_turns_of_the_same_thread_are_passed(qa_settings, store):
+    provider = ScriptedProvider(
+        ChatResult(available=True, text="Fan は 91 % です。"),
+        ChatResult(available=True, text="温度は落ち着いています。"),
+    )
+    target = handler(qa_settings, provider, store)
+    target.offer(message(ts="1787616000.000200", text="ファンの速度は？"))
+    drain(target)
+    target.offer(message(ts="1787616100.000300", thread_ts="1787616000.000200", text="温度は？"))
+    drain(target)
+    assert _users(provider, -1) == [
+        ("user", "ファンの速度は？"),
+        ("assistant", "Fan は 91 % です。"),
+        ("user", "温度は？"),
+    ]
+
+
+def test_another_thread_does_not_see_the_turns(qa_settings, store):
+    provider = ScriptedProvider(ChatResult(available=True, text="はい"))
+    target = handler(qa_settings, provider, store)
+    target.offer(message(ts="1787616000.000200", text="ファンの速度は？"))
+    drain(target)
+    target.offer(message(ts="1787616200.000400", text="温度は？"))
+    drain(target)
+    assert _users(provider, -1) == [("user", "温度は？")]
+
+
+def test_only_the_last_turns_and_threads_are_kept(qa_settings, store):
+    settings = qa_settings.model_copy(update={"history_turns": 2, "max_threads": 1})
+    provider = ScriptedProvider(ChatResult(available=True, text="答え"))
+    target = handler(settings, provider, store, limiter=UserRateLimiter(100, 60.0))
+    parent = "1787616000.000200"
+    for index in range(3):
+        target.offer(
+            message(ts=f"1787616{index + 1}00.000300", thread_ts=parent, text=f"質問{index}")
+        )
+        drain(target)
+    target.offer(message(ts="1787616900.000300", thread_ts=parent, text="最後"))
+    drain(target)
+    assert _users(provider, -1) == [
+        ("user", "質問1"),
+        ("assistant", "答え"),
+        ("user", "質問2"),
+        ("assistant", "答え"),
+        ("user", "最後"),
+    ]
+    # 別のスレッドが入ると、max_threads 1 なので前のスレッドを忘れる
+    target.offer(message(ts="1787617000.000500", text="別"))
+    drain(target)
+    target.offer(message(ts="1787617100.000600", thread_ts=parent, text="戻る"))
+    drain(target)
+    assert _users(provider, -1) == [("user", "戻る")]
+
+
+def test_failed_answers_are_not_remembered(qa_settings, store):
+    provider = ScriptedProvider(
+        ChatResult(available=False, reason="down"),
+        ChatResult(available=True, text="はい"),
+    )
+    target = handler(qa_settings, provider, store)
+    target.offer(message(ts="1787616000.000200", text="ファンの速度は？"))
+    drain(target)
+    target.offer(message(ts="1787616100.000300", thread_ts="1787616000.000200", text="温度は？"))
+    drain(target)
+    assert _users(provider, -1) == [("user", "温度は？")]
