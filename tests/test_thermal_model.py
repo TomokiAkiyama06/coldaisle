@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -718,7 +719,8 @@ def test_ridge_work_budget_rejects_before_fit(monkeypatch):
     def unexpected_fit(*args, **kwargs):
         raise AssertionError("fit must not run beyond the work budget")
 
-    monkeypatch.setattr(training_module, "_fit_ridge", unexpected_fit)
+    monkeypatch.setattr(training_module, "_ridge_gram", unexpected_fit)
+    monkeypatch.setattr(training_module, "_fit_preprocessing", unexpected_fit)
     with pytest.raises(ValueError, match="ridge演算量"):
         train_ridge_baseline(training_source(dataset), split, training_spec())
 
@@ -1229,9 +1231,9 @@ def check_limits(monkeypatch):
 
 
 def test_train_feature_cells_at_the_limit_pass_and_beyond_are_refused(check_limits):
-    # 100,000 件 × 500 列 = 50,000,000（ちょうど）。cells は通り、次の ridge の演算量で止まる
-    with pytest.raises(ValueError, match="ridge演算量"):
-        check_limits(train=100_000, purged=0, feature_count=500, output_count=1)
+    # 100,000 件 × 500 列 = 50,000,000（ちょうど）。
+    # ridge の演算量は行の集合を決めた後に数える（0187）
+    check_limits(train=100_000, purged=0, feature_count=500, output_count=1)
     with pytest.raises(ValueError, match="train feature cell数"):
         check_limits(train=100_000, purged=0, feature_count=501, output_count=1)
 
@@ -1248,9 +1250,225 @@ def test_dataset_target_cells_at_the_limit_pass_and_beyond_are_refused(check_lim
         check_limits(train=1, purged=99_999, feature_count=1, output_count=501)
 
 
-def test_ridge_work_at_the_limit_passes_and_beyond_is_refused(check_limits):
-    # 1 × (79,500 × 500² + 500³) = 20,000,000,000（ちょうど）
-    assert training_module.MAX_RIDGE_WORK_UNITS == 79_500 * 500**2 + 500**3
-    check_limits(train=79_500, purged=0, feature_count=500, output_count=1)
+def _ridge_work(*, row_sets: tuple[int, ...], heads: tuple[int, ...], columns: int) -> int:
+    """0187 §2.2 の数え方（試験の側で独立に書く。列の数はすべて同じ）。"""
+    gram = sum(rows * columns * (columns + 1) // 2 for rows in row_sets)
+    return gram + sum(rows * columns + columns**3 for rows in heads)
+
+
+def _heads(*specs: tuple[int, int, int]) -> tuple[training_module._HeadRows, ...]:
+    """(行の集合の番号, 件数, 列の数) の head。番号が同じなら同じ行の集合になる。"""
+    return tuple(
+        training_module._HeadRows(
+            horizon_ms=1_000,
+            metric=f"m{position}",
+            indices=tuple(range(offset, offset + rows)),
+            labels=(),
+            width=width,
+        )
+        for position, (offset, rows, width) in enumerate(specs)
+    )
+
+
+def test_ridge_work_at_the_limit_passes_and_beyond_is_refused():
+    # 行の集合 1 つ・head 1 つ・400 列で、上限ちょうどの件数を探す
+    columns = 400
+    per_row = columns * (columns + 1) // 2 + columns
+    rows = (training_module.MAX_RIDGE_WORK_UNITS - columns**3) // per_row
+    assert _ridge_work(row_sets=(rows,), heads=(rows,), columns=columns) <= (
+        training_module.MAX_RIDGE_WORK_UNITS
+    )
+    assert _ridge_work(row_sets=(rows + 1,), heads=(rows + 1,), columns=columns) > (
+        training_module.MAX_RIDGE_WORK_UNITS
+    )
+    training_module._validate_heads_ridge_work(_heads((0, rows, columns)))
     with pytest.raises(ValueError, match="ridge演算量"):
-        check_limits(train=79_501, purged=0, feature_count=500, output_count=1)
+        training_module._validate_heads_ridge_work(_heads((0, rows + 1, columns)))
+
+
+def test_ridge_work_counts_each_shared_row_set_once():
+    """行の集合が同じ head は Gram を 1 回だけ数え、掃き出しは head ごとに数える（0187 §2.2）。"""
+    columns = 263
+    # 試行 13 の形: head 9 つ・行の集合 2 つ（約 22,000 行）は上限の内側
+    training_module._validate_heads_ridge_work(
+        _heads(*((0, 22_166, columns),) * 6, *((1, 22_160, columns),) * 3)
+    )
+    # 同じ件数でも、行の集合が head ごとに全部違えば Gram を 9 回数え、上限を超える
+    with pytest.raises(ValueError, match="ridge演算量"):
+        training_module._validate_heads_ridge_work(
+            _heads(*((offset, 70_000, columns) for offset in range(9)))
+        )
+    training_module._validate_heads_ridge_work(_heads(*((0, 70_000, columns),) * 9))
+    shared = _ridge_work(row_sets=(70_000,), heads=(70_000,) * 9, columns=columns)
+    assert shared <= training_module.MAX_RIDGE_WORK_UNITS
+
+
+def test_shared_gram_is_counted_at_the_widest_head_of_the_row_set():
+    """因果の mask で列が head ごとに違うとき、共有する Gram は最大の列の数で数える。"""
+    narrow, wide = 100, 400
+    rows = 1_000
+    heads = _heads((0, rows, narrow), (0, rows, wide))
+    expected = rows * wide * (wide + 1) // 2 + sum(
+        rows * width + width**3 for width in (narrow, wide)
+    )
+    assert training_module._row_set_widths(heads) == {tuple(range(rows)): wide}
+    original = training_module.MAX_RIDGE_WORK_UNITS
+    try:
+        training_module.MAX_RIDGE_WORK_UNITS = expected
+        training_module._validate_heads_ridge_work(heads)
+        training_module.MAX_RIDGE_WORK_UNITS = expected - 1
+        with pytest.raises(ValueError, match="ridge演算量"):
+            training_module._validate_heads_ridge_work(heads)
+    finally:
+        training_module.MAX_RIDGE_WORK_UNITS = original
+
+
+def test_prefix_of_a_shared_gram_gives_the_same_bits_as_a_narrow_gram():
+    """先頭 k 列で解くと、k 列だけで作った Gram と bit まで同じ（因果の mask の共有）。"""
+    generator = random.Random(1870)
+    rows = tuple(tuple(generator.uniform(-3.0, 3.0) for _ in range(9)) for _ in range(30))
+    labels = tuple(generator.uniform(-5.0, 5.0) for _ in range(30))
+    shared = training_module._ridge_gram(rows, width=9)
+    for width in (3, 6, 9):
+        narrow = tuple(row[:width] for row in rows)
+        assert training_module._fit_ridge_from_gram(
+            shared, labels, width=width, ridge_lambda=0.5
+        ) == _reference_fit_ridge(narrow, labels, ridge_lambda=0.5)
+
+
+# ------------------------------------------------- Gram の共有（決定記録 0187 §2.1）
+
+
+def _reference_fit_ridge(
+    rows: tuple[tuple[float, ...], ...], labels: tuple[float, ...], *, ridge_lambda: float
+) -> tuple[float, tuple[float, ...]]:
+    """0187 の前の `_fit_ridge`（Gram の全要素を head ごとに作る）。bytes の一致を見る基準。"""
+    width = len(rows[0])
+    label_mean = math.fsum(labels) / len(labels)
+    feature_means = tuple(
+        math.fsum(row[column] for row in rows) / len(rows) for column in range(width)
+    )
+    centered_rows = tuple(
+        tuple(value - feature_means[column] for column, value in enumerate(row)) for row in rows
+    )
+    centered_labels = tuple(label - label_mean for label in labels)
+    gram = [
+        [math.fsum(row[left] * row[right] for row in centered_rows) for right in range(width)]
+        for left in range(width)
+    ]
+    for index in range(width):
+        gram[index][index] += ridge_lambda
+    rhs = [
+        math.fsum(
+            row[column] * label for row, label in zip(centered_rows, centered_labels, strict=True)
+        )
+        for column in range(width)
+    ]
+    coefficients = training_module._solve_linear_system(gram, rhs)
+    intercept = label_mean - math.fsum(
+        coefficient * mean for coefficient, mean in zip(coefficients, feature_means, strict=True)
+    )
+    return intercept, coefficients
+
+
+def test_symmetric_gram_gives_the_same_bits_as_the_full_gram():
+    generator = random.Random(187)
+    rows = tuple(tuple(generator.uniform(-3.0, 3.0) for _ in range(7)) for _ in range(40))
+    labels = tuple(generator.uniform(-5.0, 5.0) for _ in range(40))
+
+    assert _fit_ridge(rows, labels, ridge_lambda=0.25) == _reference_fit_ridge(
+        rows, labels, ridge_lambda=0.25
+    )
+
+
+def _without_label(item: DatasetExample, horizon_index: int, metric: str) -> DatasetExample:
+    targets = list(item.targets)
+    target = targets[horizon_index]
+    targets[horizon_index] = target.model_copy(
+        update={
+            "values": {**target.values, metric: None},
+            "quality": {**target.quality, metric: Quality.MISSING},
+            "missing_mask": {**target.missing_mask, metric: True},
+        }
+    )
+    return item.model_copy(update={"targets": tuple(targets)})
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        pytest.param((), id="one-row-set"),
+        pytest.param(((0, 0, TARGETS[0]), (1, 1, TARGETS[1])), id="several-row-sets"),
+        pytest.param(
+            ((0, 0, TARGETS[0]), (1, 0, TARGETS[1]), (2, 1, TARGETS[0]), (0, 1, TARGETS[1])),
+            id="every-head-differs",
+        ),
+    ],
+)
+def test_shared_gram_training_matches_the_per_head_reference(missing):
+    """行の集合を共有しても、各 head の係数は head ごとに作り直した基準と bit まで同じ。"""
+    items = list(thermal_dataset().examples)
+    for example_index, horizon_index, metric in missing:
+        items[example_index] = _without_label(items[example_index], horizon_index, metric)
+    dataset = thermal_dataset(tuple(items))
+    split = temporal_split(dataset)
+    artifact = train_ridge_baseline(training_source(dataset), split, training_spec())
+
+    train_examples = tuple(sorted(split.train, key=training_module._example_order))
+    _, _, _, rows = training_module._fit_preprocessing(
+        tuple(
+            raw_feature_values(ObservedThermalInput.from_example(item), artifact.feature_schema)
+            for item in train_examples
+        )
+    )
+    ridge_lambda = training_spec().ridge_lambda
+    for output in artifact.payload.outputs:
+        selected = [
+            (row, target.values[output.metric])
+            for item, row in zip(train_examples, rows, strict=True)
+            for target in item.targets
+            if target.horizon_ms == output.horizon_ms
+            and target.quality[output.metric] is Quality.OK
+            and target.values[output.metric] is not None
+        ]
+        expected = _reference_fit_ridge(
+            tuple(row for row, _ in selected),
+            tuple(float(label) for _, label in selected),
+            ridge_lambda=ridge_lambda,
+        )
+        assert (output.intercept, output.coefficients) == expected
+        assert output.training_samples == len(selected)
+
+
+def test_heads_are_fitted_per_row_set_and_returned_in_head_order(monkeypatch):
+    """行の集合が交互に並んでも、Gram は集合ごとに 1 回・同時に 1 つだけ作り、head の順で返す。"""
+    generator = random.Random(18701)
+    rows = tuple(tuple(generator.uniform(-2.0, 2.0) for _ in range(4)) for _ in range(12))
+    labels = tuple(generator.uniform(-1.0, 1.0) for _ in range(12))
+    first, second = tuple(range(0, 10)), tuple(range(2, 12))
+    heads = tuple(
+        training_module._HeadRows(
+            horizon_ms=1_000 * (position + 1),
+            metric="m",
+            indices=indices,
+            labels=tuple(labels[index] for index in indices),
+            width=width,
+        )
+        for position, (indices, width) in enumerate(
+            ((first, 4), (second, 4), (first, 2), (second, 3))
+        )
+    )
+    built: list[int] = []
+    original = training_module._ridge_gram
+
+    def counting(selected, *, width):
+        built.append(len(selected))
+        return original(selected, width=width)
+
+    monkeypatch.setattr(training_module, "_ridge_gram", counting)
+    fitted = training_module._fit_heads(heads, rows, ridge_lambda=0.5)
+
+    assert built == [10, 10]
+    for head, result in zip(heads, fitted, strict=True):
+        narrow = tuple(rows[index][: head.width] for index in head.indices)
+        assert result == _reference_fit_ridge(narrow, head.labels, ridge_lambda=0.5)
