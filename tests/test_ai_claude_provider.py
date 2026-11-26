@@ -306,6 +306,23 @@ def test_max_tokens_is_capped_by_the_limit(settings):
     assert seen[0]["max_tokens"] == 64
 
 
+def test_shipped_max_tokens_leaves_room_for_thinking(settings):
+    """出荷の設定は全体・`anthropic:` とも 4096 で、要求に 4096 を送る（0190 §2.1）。
+
+    Haiku 5.5 は既定で考え、その分も `max_tokens` に数える。1024 では答えの前に切れていた。
+    """
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json=reply("x"))
+
+    assert settings.max_tokens == 4096
+    assert settings.anthropic is not None and settings.anthropic.max_tokens == 4096
+    ask(provider(settings, handler))
+    assert seen[0]["max_tokens"] == 4096
+
+
 # ---------------------------------------------------------------- 選び方（0143 §2.2）
 
 

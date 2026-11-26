@@ -22,8 +22,10 @@ retry_backoff_s: 0.5
 health_summary_retry_s: 60.0
 
 # 生成の既定値。呼び出し側で上書きできる
+# max_tokens はモデルが考える分（Claude API の Haiku 5.5 は既定で adaptive thinking）も数える。
+# 1024 では答えの前に切れて捨てられていたので 4096（決定記録 0190）
 temperature: 0.2
-max_tokens: 1024
+max_tokens: 4096
 
 # 思考モードの既定。日常のQ&Aは非思考で低レイテンシ、診断時は呼び出し側で有効化する
 thinking: false
@@ -69,8 +71,8 @@ explain_context:
 #
 # 上限に達したら**呼ばずに**「利用不可」を返す。所見・説明が付かないだけで、監視と通知は動く（FR-507）。
 anthropic:
-  # 1 回の応答の上限。上の max_tokens と小さいほうを送る
-  max_tokens: 1024
+  # 1 回の応答の上限。上の max_tokens と小さいほうを送る。考える分も数える（決定記録 0190）
+  max_tokens: 4096
   # 1 プロセス・1 日（ローカル時刻の日付）あたりの HTTP 要求の回数。再試行も 1 回と数える。
   # daemon（アラートの説明）・report（日次レポート）・API（`coldaisle.server:app` で起動したときの
   # Server Health の要約）がそれぞれ数える。
